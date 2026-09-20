@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG="/etc/proton-wg-guard/config"
+TABLE="proton_killswitch"
+
+[[ -r "$CONFIG" ]] || {
+    echo "Missing configuration: $CONFIG" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+required=(WG_IF UUID ENDPOINT_FAMILY ENDPOINT_IP ENDPOINT_PORT)
+for name in "${required[@]}"; do
+    [[ -n "${!name:-}" ]] || {
+        echo "Invalid configuration: missing $name" >&2
+        exit 1
+    }
+done
+
+apply_rules() {
+    nft delete table inet "$TABLE" 2>/dev/null || true
+
+    if [[ "$ENDPOINT_FAMILY" == "ip" ]]; then
+        endpoint_rule="ip daddr $ENDPOINT_IP udp dport $ENDPOINT_PORT accept"
+    elif [[ "$ENDPOINT_FAMILY" == "ip6" ]]; then
+        endpoint_rule="ip6 daddr $ENDPOINT_IP udp dport $ENDPOINT_PORT accept"
+    else
+        echo "Unsupported ENDPOINT_FAMILY: $ENDPOINT_FAMILY" >&2
+        exit 1
+    fi
+
+    nft -f - <<NFT
+table inet $TABLE {
+    chain output {
+        type filter hook output priority -100; policy drop;
+
+        # Local applications.
+        oifname "lo" accept
+
+        # Normal traffic may leave only through the VPN tunnel.
+        oifname "$WG_IF" accept
+
+        # Permit the WireGuard transport so the tunnel can reconnect.
+        $endpoint_rule
+
+        # Permit address acquisition/renewal.
+        udp sport 68 udp dport 67 accept
+        udp sport 546 udp dport 547 accept
+
+        # Essential IPv6 local-link discovery only.
+        meta l4proto ipv6-icmp icmpv6 type {
+            nd-neighbor-solicit,
+            nd-neighbor-advert,
+            nd-router-solicit,
+            nd-router-advert
+        } accept
+    }
+}
+NFT
+}
+
+remove_rules() {
+    nft delete table inet "$TABLE" 2>/dev/null || true
+}
+
+vpn_active() {
+    nmcli -t -f UUID connection show --active 2>/dev/null | grep -Fxq "$UUID"
+}
+
+reconnect() {
+    logger -t proton-wg-guard "WireGuard inactive; requesting reconnect"
+    nmcli connection up uuid "$UUID" >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+    apply)
+        apply_rules
+        ;;
+    remove)
+        remove_rules
+        ;;
+    watch)
+        apply_rules
+
+        while sleep 10; do
+            if ! vpn_active; then
+                reconnect
+            fi
+        done
+        ;;
+    *)
+        echo "Usage: $0 {apply|remove|watch}" >&2
+        exit 2
+        ;;
+esac

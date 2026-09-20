@@ -1,0 +1,13 @@
+[Unit]
+Description=Proton WireGuard kill switch and reconnect watchdog
+After=NetworkManager.service firewalld.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/proton-wg-guard watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
